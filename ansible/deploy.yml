@@ -1,0 +1,107 @@
+- hosts: 127.0.0.1
+  connection: local
+  tasks:
+    - name: Example Group
+      ec2_group:
+        name: chocrates_example
+        description: chocrates test group
+        region: "{{ region }}"
+        rules:
+          - proto: all
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allows ssh
+
+          - proto: all
+            from_port: 8080 
+            to_port: 8080
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allows spring petclinic app 
+      register: vpc
+
+    - name: Launch an EC2 Instance
+      local_action: ec2
+           instance_type={{ instance_type }}
+           image={{ ami }}
+           region={{ region }}
+           key_name={{ pem }}
+           count={{ count }}
+           group_id="{{ vpc.group_id }}"
+           wait=true
+      register: ec2
+
+    - name: Waiting for the instance to come up
+      local_action: wait_for
+                    host={{ item.public_ip }}
+                    state=started
+                    port=22
+      loop: "{{ ec2.instances }}"
+    
+    - name: Adding tags to the EC2 Instance
+      local_action: ec2_tag
+                    region={{ region }}
+                    resource={{ item.id }}
+                    state=present
+      loop: "{{ ec2.instances }}"
+      args:
+       tags:
+           Name: "{{ name }}"
+      register: tag
+
+    - name: Add new isntance to host group
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groupname: launched
+        inventory_dir: "~"
+      loop: "{{ ec2.instances }}"
+
+- hosts: launched
+  remote_user: ubuntu
+  become: true
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+    - name: Update and upgrade apt packages again?
+      apt:
+        upgrade: yes
+        update_cache: yes
+    - name: Install dependencies
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+       - "git"
+       - "openjdk-11-jdk-headless"
+    - name: Start jar file in the background
+      shell: |
+        git clone https://github.com/spring-projects/spring-petclinic.git /opt/spring-petclinic
+        cd /opt/spring-petclinic
+        sudo ./mvnw package
+        cat <<EOF > /opt/spring-petclinic/run.sh
+        #!/bin/sh
+        sudo   /usr/bin/java -jar target/*.jar
+        EOF
+        chmod +x /opt/spring-petclinic/run.sh
+
+        cat <<EOF > spring-petclinic.service
+        [Unit]
+        Description=Spring PetClinic App
+        [Service]
+        User=ubuntu
+        WorkingDirectory=/opt/spring-petclinic
+        ExecStart=/opt/spring-petclinic/run.sh
+        SuccessExitStatus=143
+        Restart=on-failure
+        RestartSec=5
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        sudo mv spring-petclinic.service /etc/systemd/system/spring-petclinic.service
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable spring-petclinic.service
+        sudo systemctl start spring-petclinic.service
